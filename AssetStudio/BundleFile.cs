@@ -28,7 +28,7 @@ namespace AssetStudio
         Lzma,
         Lz4,
         Lz4HC,
-        Lzham
+        ArkLz4
     }
 
     public class BundleFile
@@ -99,6 +99,81 @@ namespace AssetStudio
                         ReadFiles(blocksStream, reader.FullPath);
                     }
                     break;
+            }
+        }
+
+        private static (int length, int newPos) ReadLongLength(byte[] data, int pos)
+        {
+            int num = 0;
+            byte b;
+            do
+            {
+                if (pos >= data.Length)
+                {
+                    throw new EndOfStreamException("Failed to read long length: unexpected end of data.");
+                }
+                b = data[pos];
+                pos++;
+                num += b;
+            }
+            while (b == byte.MaxValue);
+            return (num, pos);
+        }
+
+        private static void DecompressArkLz4(byte[] compressedBytes, int compressedSize, byte[] uncompressedBytes, int uncompressedSize)
+        {
+            byte[] array = BigArrayPool<byte>.Shared.Rent(compressedSize);
+            try
+            {
+                Buffer.BlockCopy(compressedBytes, 0, array, 0, compressedSize);
+                int num = 0;
+                long num2 = 0L;
+                while (num < compressedSize)
+                {
+                    byte num3 = array[num];
+                    int num4 = num3 & 0xF;
+                    int num5 = (num3 & 0xF0) >> 4;
+                    array[num] = (byte)((num4 << 4) | num5);
+                    num++;
+                    if (num4 == 15)
+                    {
+                        var tuple = ReadLongLength(array, num);
+                        num4 += tuple.length;
+                        num = tuple.newPos;
+                    }
+                    num2 += num4;
+                    num += num4;
+                    if (uncompressedSize - num2 < 12 || num + 1 >= compressedSize)
+                    {
+                        break;
+                    }
+                    byte b = array[num];
+                    ushort num6 = (ushort)(array[num + 1] | (b << 8));
+                    array[num] = (byte)(num6 & 0xFF);
+                    array[num + 1] = (byte)(num6 >> 8);
+                    num += 2;
+                    if (num5 == 15)
+                    {
+                        if (num >= compressedSize)
+                        {
+                            break;
+                        }
+                        var tuple2 = ReadLongLength(array, num);
+                        num5 += tuple2.length;
+                        num = tuple2.newPos;
+                    }
+                    num5 += 4;
+                    num2 += num5;
+                }
+                int num7 = LZ4Codec.Decode(array, 0, compressedSize, uncompressedBytes, 0, uncompressedSize);
+                if (num7 != uncompressedSize)
+                {
+                    throw new IOException($"Custom Lz4 decompression error, wrote {num7} bytes but expected {uncompressedSize} bytes after pre-processing");
+                }
+            }
+            finally
+            {
+                BigArrayPool<byte>.Shared.Return(array);
             }
         }
 
@@ -267,12 +342,38 @@ namespace AssetStudio
                     }
                 case CompressionType.Lz4:
                 case CompressionType.Lz4HC:
+                case CompressionType.ArkLz4:
                     {
                         var uncompressedBytes = new byte[uncompressedSize];
-                        var numWrite = LZ4Codec.Decode(blocksInfoBytes, uncompressedBytes);
-                        if (numWrite != uncompressedSize)
+                        if (compressionType == CompressionType.ArkLz4 || compressionType == CompressionType.Lz4)
                         {
-                            throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                            try
+                            {
+                                DecompressArkLz4(blocksInfoBytes, blocksInfoBytes.Length, uncompressedBytes, (int)uncompressedSize);
+                            }
+                            catch
+                            {
+                                if (compressionType == CompressionType.Lz4)
+                                {
+                                    var numWrite = LZ4Codec.Decode(blocksInfoBytes, uncompressedBytes);
+                                    if (numWrite != uncompressedSize)
+                                    {
+                                        throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                    }
+                                }
+                                else
+                                {
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var numWrite = LZ4Codec.Decode(blocksInfoBytes, uncompressedBytes);
+                            if (numWrite != uncompressedSize)
+                            {
+                                throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                            }
                         }
                         blocksInfoUncompresseddStream = new MemoryStream(uncompressedBytes);
                         break;
@@ -333,17 +434,45 @@ namespace AssetStudio
                         }
                     case CompressionType.Lz4:
                     case CompressionType.Lz4HC:
+                    case CompressionType.ArkLz4:
                         {
                             var compressedSize = (int)blockInfo.compressedSize;
                             var compressedBytes = BigArrayPool<byte>.Shared.Rent(compressedSize);
                             reader.Read(compressedBytes, 0, compressedSize);
                             var uncompressedSize = (int)blockInfo.uncompressedSize;
                             var uncompressedBytes = BigArrayPool<byte>.Shared.Rent(uncompressedSize);
-                            var numWrite = LZ4Codec.Decode(compressedBytes, 0, compressedSize, uncompressedBytes, 0, uncompressedSize);
-                            if (numWrite != uncompressedSize)
+                            
+                            if (compressionType == CompressionType.ArkLz4 || compressionType == CompressionType.Lz4)
                             {
-                                throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                try
+                                {
+                                    DecompressArkLz4(compressedBytes, compressedSize, uncompressedBytes, uncompressedSize);
+                                }
+                                catch
+                                {
+                                    if (compressionType == CompressionType.Lz4)
+                                    {
+                                        var numWrite = LZ4Codec.Decode(compressedBytes, 0, compressedSize, uncompressedBytes, 0, uncompressedSize);
+                                        if (numWrite != uncompressedSize)
+                                        {
+                                            throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        throw;
+                                    }
+                                }
                             }
+                            else 
+                            {
+                                var numWrite = LZ4Codec.Decode(compressedBytes, 0, compressedSize, uncompressedBytes, 0, uncompressedSize);
+                                if (numWrite != uncompressedSize)
+                                {
+                                    throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                }
+                            }
+                            
                             blocksStream.Write(uncompressedBytes, 0, uncompressedSize);
                             BigArrayPool<byte>.Shared.Return(compressedBytes);
                             BigArrayPool<byte>.Shared.Return(uncompressedBytes);
